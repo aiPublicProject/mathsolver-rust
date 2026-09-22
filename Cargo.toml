@@ -1,0 +1,18 @@
+[package]
+name = "mathsolver"
+version = "0.1.0"
+edition = "2021"
+description = "BYOK AI math solver with independent verification — bring your own OpenAI-compatible API key, answers verified by local expression evaluation."
+license = "MIT"
+repository = "https://github.com/mathsolver-help/mathsolver-rust"
+homepage = "https://mathsolver.help"
+keywords = ["math", "solver", "ai", "byok", "verification"]
+categories = ["mathematics", "api-bindings"]
+
+[dependencies]
+serde_json = "1"
+ureq = "2"
+
+[lib]
+name = "mathsolver"
+path = "src/lib.rs"

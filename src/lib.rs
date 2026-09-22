@@ -337,13 +337,16 @@ fn numerically_equal(a: f64, b: f64) -> bool {
 }
 
 /* ------------------------------------------------------------------ */
-/* Transport + solve                                                    */
+/* Client (instantiate once, solve many)                                */
 /* ------------------------------------------------------------------ */
 
-fn default_transport(url: &str, body: &str, api_key: &str) -> Result<String, SolverError> {
+pub type TransportFn = Box<dyn Fn(&str, &str, &str) -> Result<String, SolverError> + Send + Sync>;
+
+pub fn default_transport(url: &str, body: &str, api_key: &str) -> Result<String, SolverError> {
     let resp = ureq::post(url)
         .set("Content-Type", "application/json")
         .set("Authorization", &format!("Bearer {}", api_key))
+        .timeout(std::time::Duration::from_secs(60))
         .send_string(body)
         .map_err(|e| SolverError::new("HTTP_ERROR", e.to_string()))?;
     let text = resp
@@ -357,80 +360,126 @@ fn default_transport(url: &str, body: &str, api_key: &str) -> Result<String, Sol
         .ok_or_else(|| SolverError::new("HTTP_ERROR", "API response missing message content"))
 }
 
-/// Solve with an injected transport (url, body_json, api_key) -> model text. Used by tests.
-pub fn solve_with_transport<F>(problem: &str, opts: &SolveOptions, mut transport: F) -> Result<SolveResult, SolverError>
-where
-    F: FnMut(&str, &str, &str) -> Result<String, SolverError>,
-{
-    if opts.api_key.is_empty() {
-        return Err(SolverError::new("NO_API_KEY", "api_key is required (BYOK)"));
-    }
-    if problem.trim().is_empty() {
-        return Err(SolverError::new("NO_PROBLEM", "problem must be non-empty"));
-    }
-    let url = format!("{}/chat/completions", opts.base_url.trim_end_matches('/'));
-
-    let mut messages = vec![
-        json!({"role": "system", "content": SYSTEM_PROMPT}),
-        json!({"role": "user", "content": problem}),
-    ];
-    let mut call = |messages: &Vec<Value>| -> Result<String, SolverError> {
-        let body = json!({"model": opts.model, "messages": messages, "temperature": 0}).to_string();
-        transport(&url, &body, &opts.api_key)
-    };
-
-    let mut parsed = match parse_solver_json(&call(&messages)?) {
-        Ok(p) => p,
-        Err(e) if e.code == "INVALID_JSON" => {
-            messages.push(json!({"role": "assistant", "content": "invalid JSON"}));
-            messages.push(json!({"role": "user", "content": "Your reply was not valid JSON. Reply again with the exact strict JSON shape."}));
-            parse_solver_json(&call(&messages)?)?
-        }
-        Err(e) => return Err(e),
-    };
-
-    let evaluate = |p: &Parsed| -> (Option<f64>, bool) {
-        match eval_expression(&p.expression) {
-            Ok(ev) => (Some(ev), numerically_equal(ev, p.answer)),
-            Err(_) => (None, false),
-        }
-    };
-
-    let (mut evaluated, mut verified) = evaluate(&parsed);
-    let mut retries = 0u32;
-    if !verified {
-        retries = 1;
-        messages.push(json!({"role": "assistant", "content": serde_json::to_string(&json!({
-            "answer": parsed.answer, "steps": parsed.steps, "verification": {"expression": parsed.expression}
-        })).unwrap_or_default()}));
-        messages.push(json!({"role": "user", "content": format!(
-            "Your verification expression evaluated to {}, which does not match your answer {}. Re-derive carefully and reply again with the same strict JSON shape.",
-            evaluated.map(|v| v.to_string()).unwrap_or_else(|| "an error".into()),
-            parsed.answer
-        )}));
-        if let Ok(second) = parse_solver_json(&call(&messages)?) {
-            let (ev2, ok2) = evaluate(&second);
-            if ev2.is_some() {
-                evaluated = ev2;
-            }
-            if ok2 {
-                parsed = second;
-                verified = true;
-            }
-        }
-    }
-
-    Ok(SolveResult {
-        answer: parsed.answer,
-        steps: parsed.steps,
-        expression: parsed.expression,
-        evaluated,
-        verified,
-        retries,
-    })
+/// BYOK client for an OpenAI-compatible endpoint.
+///
+/// ```no_run
+/// let solver = mathsolver::MathSolver::new("sk-...", "https://api.deepseek.com/v1")
+///     .unwrap().model("deepseek-chat");
+/// let r = solver.solve("2x + 3 = 11, solve for x").unwrap(); // r.verified == true
+/// ```
+pub struct MathSolver {
+    api_key: String,
+    base_url: String,
+    model: String,
+    transport: TransportFn,
 }
 
-/// Solve using the built-in HTTP transport (ureq).
-pub fn solve(problem: &str, opts: &SolveOptions) -> Result<SolveResult, SolverError> {
-    solve_with_transport(problem, opts, default_transport)
+impl std::fmt::Debug for MathSolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MathSolver")
+            .field("base_url", &self.base_url)
+            .field("model", &self.model)
+            .finish_non_exhaustive()
+    }
+}
+
+impl MathSolver {
+    /// Create a client with the built-in HTTP transport (ureq).
+    pub fn new(api_key: &str, base_url: &str) -> Result<Self, SolverError> {
+        Self::with_transport(api_key, base_url, default_transport)
+    }
+
+    /// Create a client with an injected transport `(url, body_json, api_key) -> model text`.
+    pub fn with_transport<F>(api_key: &str, base_url: &str, transport: F) -> Result<Self, SolverError>
+    where
+        F: Fn(&str, &str, &str) -> Result<String, SolverError> + Send + Sync + 'static,
+    {
+        if api_key.is_empty() {
+            return Err(SolverError::new("NO_API_KEY", "api_key is required (BYOK)"));
+        }
+        let base = base_url.trim_end_matches('/');
+        if !(base.starts_with("http://") || base.starts_with("https://")) {
+            return Err(SolverError::new("BAD_BASE_URL", "base_url must be an http(s) URL, e.g. https://api.deepseek.com/v1"));
+        }
+        Ok(Self {
+            api_key: api_key.to_string(),
+            base_url: base.to_string(),
+            model: "gpt-4o-mini".to_string(),
+            transport: Box::new(transport),
+        })
+    }
+
+    /// Builder-style model override.
+    pub fn model(mut self, model: impl Into<String>) -> Self {
+        self.model = model.into();
+        self
+    }
+
+    /// Solve a math problem. `verified` is true only when the model's
+    /// verification expression independently re-evaluates to the answer.
+    pub fn solve(&self, problem: &str) -> Result<SolveResult, SolverError> {
+        if problem.trim().is_empty() {
+            return Err(SolverError::new("NO_PROBLEM", "problem must be non-empty"));
+        }
+        let url = format!("{}/chat/completions", self.base_url);
+
+        let mut messages = vec![
+            json!({"role": "system", "content": SYSTEM_PROMPT}),
+            json!({"role": "user", "content": problem}),
+        ];
+        let call = |messages: &Vec<Value>| -> Result<String, SolverError> {
+            let body = json!({"model": self.model, "messages": messages, "temperature": 0}).to_string();
+            (self.transport)(&url, &body, &self.api_key)
+        };
+
+        let mut parsed = match parse_solver_json(&call(&messages)?) {
+            Ok(p) => p,
+            Err(e) if e.code == "INVALID_JSON" => {
+                messages.push(json!({"role": "assistant", "content": "invalid JSON"}));
+                messages.push(json!({"role": "user", "content": "Your reply was not valid JSON. Reply again with the exact strict JSON shape."}));
+                parse_solver_json(&call(&messages)?)?
+            }
+            Err(e) => return Err(e),
+        };
+
+        let evaluate = |p: &Parsed| -> (Option<f64>, bool) {
+            match eval_expression(&p.expression) {
+                Ok(ev) => (Some(ev), numerically_equal(ev, p.answer)),
+                Err(_) => (None, false),
+            }
+        };
+
+        let (mut evaluated, mut verified) = evaluate(&parsed);
+        let mut retries = 0u32;
+        if !verified {
+            retries = 1;
+            messages.push(json!({"role": "assistant", "content": serde_json::to_string(&json!({
+                "answer": parsed.answer, "steps": parsed.steps, "verification": {"expression": parsed.expression}
+            })).unwrap_or_default()}));
+            messages.push(json!({"role": "user", "content": format!(
+                "Your verification expression evaluated to {}, which does not match your answer {}. Re-derive the problem carefully and reply again with the same strict JSON shape.",
+                evaluated.map(|v| v.to_string()).unwrap_or_else(|| "an error".into()),
+                parsed.answer
+            )}));
+            if let Ok(second) = parse_solver_json(&call(&messages)?) {
+                let (ev2, ok2) = evaluate(&second);
+                if ev2.is_some() {
+                    evaluated = ev2;
+                }
+                if ok2 {
+                    parsed = second;
+                    verified = true;
+                }
+            }
+        }
+
+        Ok(SolveResult {
+            answer: parsed.answer,
+            steps: parsed.steps,
+            expression: parsed.expression,
+            evaluated,
+            verified,
+            retries,
+        })
+    }
 }

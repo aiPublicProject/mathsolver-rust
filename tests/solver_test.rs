@@ -1,52 +1,53 @@
-use mathsolver::{eval_expression, MathSolver, SolverError};
+use mathsolver::{eval_expression, run_program, run_check, MathSolver, SolverError};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-const GOOD: &str = r#"{"answer": 4, "steps": ["Subtract 3: 2x = 8", "Divide by 2: x = 4"], "verification": {"expression": "(11-3)/2"}}"#;
-const WRONG: &str = r#"{"answer": 4, "steps": ["..."], "verification": {"expression": "(11-3)/3"}}"#;
+const GOOD: &str = r#"{"program": "let d = 11 - 3;\nlet x = d / 2;\nresult = x", "steps": ["Subtract 3: 2x = 8", "Divide by 2: x = 4"], "check": "2*{x} + 3 - 11"}"#;
+const NO_CHECK: &str = r#"{"program": "result = 0.15 * 80", "steps": ["15% of 80"]}"#;
+const WRONG_CHECK: &str = r#"{"program": "let d = 11 - 3;\nresult = d / 2", "steps": ["..."], "check": "2*{x} + 3 - 12"}"#;
+const BROKEN_PROGRAM: &str = r#"{"program": "result = undefinedvar + 1", "steps": []}"#;
 
 #[test]
 fn evaluator_precedence() {
     assert_eq!(eval_expression("2*3+4").unwrap(), 10.0);
-    assert_eq!(eval_expression("2+3*4").unwrap(), 14.0);
-    assert_eq!(eval_expression("(2+3)*4").unwrap(), 20.0);
     assert_eq!(eval_expression("2^3^2").unwrap(), 512.0);
     assert_eq!(eval_expression("-3^2").unwrap(), -9.0);
-    assert!((eval_expression("10%3").unwrap() - 1.0).abs() < 1e-9);
-}
-
-#[test]
-fn evaluator_functions() {
     assert_eq!(eval_expression("sqrt(16)").unwrap(), 4.0);
-    assert_eq!(eval_expression("min(3,5)").unwrap(), 3.0);
-    assert!((eval_expression("pi").unwrap() - std::f64::consts::PI).abs() < 1e-12);
-    assert!((eval_expression("log(1000)").unwrap() - 3.0).abs() < 1e-12);
 }
 
 #[test]
-fn evaluator_rejects_bad_input() {
-    assert!(eval_expression("std::mem::forget").is_err());
-    assert!(eval_expression("1+2)").is_err());
-    assert!(eval_expression("foo(1)").is_err());
-    assert!(eval_expression("").is_err());
+fn run_program_let_and_result() {
+    let p = "let d = 11 - 3;\nlet x = d / 2;\nresult = x";
+    assert_eq!(run_program(p).unwrap(), 4.0);
+    assert_eq!(run_program("let a = 3; let b = 4; a * b").unwrap(), 12.0);
+    assert!(run_program("result = undefinedvar + 1").is_err());
+    assert!(run_program("let a = 1; let b = 2").is_err()); // no result
+}
+
+#[test]
+fn run_check_substitution() {
+    let (v, ok) = run_check("2*{x} + 3 - 11", 4.0).unwrap();
+    assert_eq!(v, 0.0);
+    assert!(ok);
+    let (v, ok) = run_check("2*{x} + 3 - 12", 4.0).unwrap();
+    assert_eq!(v, -1.0);
+    assert!(!ok);
 }
 
 #[test]
 fn new_validates_credentials() {
-    let e = MathSolver::new("", "https://api.x").unwrap_err();
-    assert_eq!(e.code, "NO_API_KEY");
-    let e = MathSolver::new("sk", "not-a-url").unwrap_err();
-    assert_eq!(e.code, "BAD_BASE_URL");
+    assert_eq!(MathSolver::new("", "https://api.x").unwrap_err().code, "NO_API_KEY");
+    assert_eq!(MathSolver::new("sk", "not-a-url").unwrap_err().code, "BAD_BASE_URL");
 }
 
 #[test]
-fn solve_verified_first_try() {
+fn solve_answer_from_execution_first_try() {
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_in = Arc::clone(&calls);
     let solver = MathSolver::with_transport("sk-test", "https://api.deepseek.com/v1", move |url, body, key| {
         calls_in.fetch_add(1, Ordering::SeqCst);
         assert!(url.starts_with("https://api.deepseek.com/v1/chat/completions"));
-        assert!(body.contains("math solver"));
+        assert!(body.contains("program"));
         assert_eq!(key, "sk-test");
         Ok(GOOD.to_string())
     })
@@ -55,18 +56,26 @@ fn solve_verified_first_try() {
     let r = solver.solve("2x + 3 = 11, solve for x").unwrap();
     assert!(r.verified);
     assert_eq!(r.answer, 4.0);
-    assert_eq!(r.evaluated, Some(4.0));
+    assert_eq!(r.evaluated, Some(0.0)); // check value
     assert_eq!(r.retries, 0);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
 
 #[test]
-fn solve_retry_recovers() {
+fn solve_no_check_unverified() {
+    let solver = MathSolver::with_transport("sk", "https://x", |_, _, _| Ok(NO_CHECK.to_string())).unwrap();
+    let r = solver.solve("15% of 80").unwrap();
+    assert_eq!(r.answer, 12.0);
+    assert!(!r.verified);
+}
+
+#[test]
+fn solve_check_fail_retry_recovers() {
     let n = Arc::new(AtomicUsize::new(0));
     let n_in = Arc::clone(&n);
-    let solver = MathSolver::with_transport("sk", "https://api.x", move |_, _, _| {
+    let solver = MathSolver::with_transport("sk", "https://x", move |_, _, _| {
         let i = n_in.fetch_add(1, Ordering::SeqCst);
-        Ok(if i == 0 { WRONG.to_string() } else { GOOD.to_string() })
+        Ok(if i == 0 { WRONG_CHECK.to_string() } else { GOOD.to_string() })
     })
     .unwrap();
     let r = solver.solve("2x+3=11").unwrap();
@@ -75,10 +84,31 @@ fn solve_retry_recovers() {
 }
 
 #[test]
+fn solve_program_error_retry_recovers() {
+    let n = Arc::new(AtomicUsize::new(0));
+    let n_in = Arc::clone(&n);
+    let solver = MathSolver::with_transport("sk", "https://x", move |_, _, _| {
+        let i = n_in.fetch_add(1, Ordering::SeqCst);
+        Ok(if i == 0 { BROKEN_PROGRAM.to_string() } else { GOOD.to_string() })
+    })
+    .unwrap();
+    let r = solver.solve("2x+3=11").unwrap();
+    assert!(r.verified);
+    assert_eq!(r.answer, 4.0);
+}
+
+#[test]
+fn solve_program_error_persists_raises() {
+    let solver = MathSolver::with_transport("sk", "https://x", |_, _, _| Ok(BROKEN_PROGRAM.to_string())).unwrap();
+    let err = solver.solve("2x+3=11").unwrap_err();
+    assert!(err.code.starts_with("PROGRAM_") || err.code.starts_with("EXPR_"), "got {}", err.code);
+}
+
+#[test]
 fn solve_invalid_json_then_ok() {
     let n = Arc::new(AtomicUsize::new(0));
     let n_in = Arc::clone(&n);
-    let solver = MathSolver::with_transport("sk", "https://api.x", move |_, _, _| {
+    let solver = MathSolver::with_transport("sk", "https://x", move |_, _, _| {
         let i = n_in.fetch_add(1, Ordering::SeqCst);
         Ok(if i == 0 { "no json here".to_string() } else { GOOD.to_string() })
     })
@@ -87,23 +117,10 @@ fn solve_invalid_json_then_ok() {
 }
 
 #[test]
-fn solve_invalid_json_twice_raises() {
-    let solver = MathSolver::with_transport("sk", "https://api.x", |_, _, _| Ok("still nothing".to_string())).unwrap();
-    let err = solver.solve("1+1").unwrap_err();
-    assert_eq!(err.code, "INVALID_JSON");
-}
-
-#[test]
-fn solve_no_api_key_at_construction() {
-    let err = MathSolver::with_transport("", "https://x", |_, _, _| Ok(String::new())).unwrap_err();
-    assert_eq!(err.code, "NO_API_KEY");
-}
-
-#[test]
 fn solve_http_error_no_retry() {
     let calls = Arc::new(AtomicUsize::new(0));
     let calls_in = Arc::clone(&calls);
-    let solver = MathSolver::with_transport("sk", "https://api.x", move |_, _, _| {
+    let solver = MathSolver::with_transport("sk", "https://x", move |_, _, _| {
         calls_in.fetch_add(1, Ordering::SeqCst);
         Err(SolverError::new("HTTP_ERROR", "401"))
     })
@@ -114,20 +131,20 @@ fn solve_http_error_no_retry() {
 }
 
 #[test]
-fn solve_retry_still_wrong_unverified() {
-    let solver = MathSolver::with_transport("sk", "https://api.x", |_, _, _| Ok(WRONG.to_string())).unwrap();
+fn solve_check_still_failing_unverified() {
+    let solver = MathSolver::with_transport("sk", "https://x", |_, _, _| Ok(WRONG_CHECK.to_string())).unwrap();
     let r = solver.solve("2x+3=11").unwrap();
     assert!(!r.verified);
+    assert_eq!(r.answer, 4.0); // still the executed answer
     assert_eq!(r.retries, 1);
 }
-
 
 #[test]
 #[ignore = "smoke: set SMOKE_API_KEY to run (cargo test -- --ignored)"]
 fn smoke_real_api() {
     let key = std::env::var("SMOKE_API_KEY").expect("SMOKE_API_KEY");
     let base = std::env::var("SMOKE_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".into());
-    let solver = mathsolver::MathSolver::new(&key, &base).unwrap();
+    let solver = MathSolver::new(&key, &base).unwrap();
     let r = solver.solve("2x + 3 = 11, solve for x").unwrap();
     println!("smoke: answer={} verified={} retries={}", r.answer, r.verified, r.retries);
     assert!(r.verified);

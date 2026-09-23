@@ -7,17 +7,27 @@
 use serde_json::{json, Value};
 use std::fmt;
 
-pub const SYSTEM_PROMPT: &str = "You are a precise math solver.\n\
-Reply with STRICT JSON only, no markdown fences, in this exact shape:\n\
-{\"answer\": <number>, \"steps\": [<string>, ...], \"verification\": {\"expression\": \"<string>\"}}\n\
-Rules:\n\
-- \"answer\" must be a single number (the final result).\n\
-- \"steps\" must be an array of short plain-language explanation strings.\n\
-- \"verification.expression\" must be a pure arithmetic expression that\n\
-  evaluates to the answer. Allowed: numbers, + - * / % ^ ( ), and the\n\
-  functions abs sqrt sin cos tan ln log exp floor ceil round min max\n\
-  (log is base 10, ln is natural), and the constants pi and e.\n\
-- The expression must recompute the answer independently.";
+pub const SYSTEM_PROMPT: &str = "You are a precise math solver.
+Reply with STRICT JSON only, no markdown fences, in this exact shape:
+{\"program\": \"<string>\", \"steps\": [<string>, ...], \"check\": \"<string>\"}
+Rules:
+- \"program\" is a small JavaScript-like program that computes the final answer.
+  One statement per line (or ; separated). Allowed statements:
+      let NAME = EXPRESSION
+      result = EXPRESSION
+  EXPRESSIONs may use numbers, + - * / % ^ ( ), the functions
+  abs sqrt sin cos tan ln log exp floor ceil round min max
+  (log is base 10, ln is natural), the constants pi and e, and any
+  variable defined by an earlier let. The value assigned to result
+  is the answer. Never state the answer as a number in text.
+- \"steps\" is an array of short plain-language explanation strings.
+- \"check\" is a verification expression containing the placeholder {x}.
+  After solving, {x} is replaced by the computed answer and the whole
+  expression must evaluate to 0.
+  For equations, substitute the answer back into the original equation
+  (e.g. 2x+3=11 -> \"2*{x}+3-11\").
+  For arithmetic, recompute via a different path and subtract the answer
+  (e.g. 15% of 80 -> \"80*15/100-{x}\"). Provide \"check\" whenever possible.";
 
 #[derive(Debug, Clone)]
 pub struct SolverError {
@@ -175,8 +185,17 @@ fn apply_fn(name: &str, args: &[f64]) -> Result<f64, SolverError> {
     Ok(v)
 }
 
-/// Evaluate a pure arithmetic expression string to a number.
+use std::collections::HashMap;
+
+pub type Env = HashMap<String, f64>;
+
+/// Evaluate a pure arithmetic expression string to a number (no variables).
 pub fn eval_expression(src: &str) -> Result<f64, SolverError> {
+    eval_expression_with(src, &Env::new())
+}
+
+/// Evaluate with variable bindings from let-statements.
+pub fn eval_expression_with(src: &str, env: &Env) -> Result<f64, SolverError> {
     if src.trim().is_empty() {
         return Err(SolverError::new("EXPR_EMPTY", "empty expression"));
     }
@@ -198,27 +217,27 @@ pub fn eval_expression(src: &str) -> Result<f64, SolverError> {
         }
     }
 
-    fn expr(tokens: &[Tok], pos: &mut usize) -> Result<f64, SolverError> {
-        let mut v = term(tokens, pos)?;
+    fn expr(tokens: &[Tok], pos: &mut usize, env: &Env) -> Result<f64, SolverError> {
+        let mut v = term(tokens, pos, env)?;
         while let Some(Tok::Op(op)) = peek(tokens, *pos) {
             if *op != '+' && *op != '-' {
                 break;
             }
             eat(tokens, pos)?;
-            let r = term(tokens, pos)?;
+            let r = term(tokens, pos, env)?;
             v = if *op == '+' { v + r } else { v - r };
         }
         Ok(v)
     }
 
-    fn term(tokens: &[Tok], pos: &mut usize) -> Result<f64, SolverError> {
-        let mut v = unary(tokens, pos)?;
+    fn term(tokens: &[Tok], pos: &mut usize, env: &Env) -> Result<f64, SolverError> {
+        let mut v = unary(tokens, pos, env)?;
         while let Some(Tok::Op(op)) = peek(tokens, *pos) {
             if *op != '*' && *op != '/' && *op != '%' {
                 break;
             }
             eat(tokens, pos)?;
-            let r = unary(tokens, pos)?;
+            let r = unary(tokens, pos, env)?;
             v = match op {
                 '*' => v * r,
                 '/' => v / r,
@@ -228,39 +247,42 @@ pub fn eval_expression(src: &str) -> Result<f64, SolverError> {
         Ok(v)
     }
 
-    fn unary(tokens: &[Tok], pos: &mut usize) -> Result<f64, SolverError> {
+    fn unary(tokens: &[Tok], pos: &mut usize, env: &Env) -> Result<f64, SolverError> {
         if let Some(Tok::Op('-')) = peek(tokens, *pos) {
             eat(tokens, pos)?;
-            return Ok(-unary(tokens, pos)?);
+            return Ok(-unary(tokens, pos, env)?);
         }
         if let Some(Tok::Op('+')) = peek(tokens, *pos) {
             eat(tokens, pos)?;
-            return unary(tokens, pos);
+            return unary(tokens, pos, env);
         }
-        power(tokens, pos)
+        power(tokens, pos, env)
     }
 
-    fn power(tokens: &[Tok], pos: &mut usize) -> Result<f64, SolverError> {
-        let base = atom(tokens, pos)?;
+    fn power(tokens: &[Tok], pos: &mut usize, env: &Env) -> Result<f64, SolverError> {
+        let base = atom(tokens, pos, env)?;
         if let Some(Tok::Op('^')) = peek(tokens, *pos) {
             eat(tokens, pos)?;
-            let exp = unary(tokens, pos)?; // right associative
+            let exp = unary(tokens, pos, env)?; // right associative
             return Ok(base.powf(exp));
         }
         Ok(base)
     }
 
-    fn atom(tokens: &[Tok], pos: &mut usize) -> Result<f64, SolverError> {
+    fn atom(tokens: &[Tok], pos: &mut usize, env: &Env) -> Result<f64, SolverError> {
         match eat(tokens, pos)? {
             Tok::Num(v) => Ok(v),
             Tok::Id(id) => {
+                if let Some(v) = env.get(id.as_str()) {
+                    return Ok(*v);
+                }
                 let name = id.to_lowercase();
                 if let Some(Tok::Op('(')) = peek(tokens, *pos) {
                     eat(tokens, pos)?;
-                    let mut args = vec![expr(tokens, pos)?];
+                    let mut args = vec![expr(tokens, pos, env)?];
                     while let Some(Tok::Op(',')) = peek(tokens, *pos) {
                         eat(tokens, pos)?;
-                        args.push(expr(tokens, pos)?);
+                        args.push(expr(tokens, pos, env)?);
                     }
                     if !matches!(eat(tokens, pos)?, Tok::Op(')')) {
                         return Err(SolverError::new("EXPR_SYNTAX", "expected )"));
@@ -275,7 +297,7 @@ pub fn eval_expression(src: &str) -> Result<f64, SolverError> {
                 }
             }
             Tok::Op('(') => {
-                let v = expr(tokens, pos)?;
+                let v = expr(tokens, pos, env)?;
                 if !matches!(eat(tokens, pos)?, Tok::Op(')')) {
                     return Err(SolverError::new("EXPR_SYNTAX", "expected )"));
                 }
@@ -285,7 +307,7 @@ pub fn eval_expression(src: &str) -> Result<f64, SolverError> {
         }
     }
 
-    let value = expr(&tokens, &mut pos)?;
+    let value = expr(&tokens, &mut pos, env)?;
     if pos != tokens.len() {
         return Err(SolverError::new("EXPR_TRAILING", "trailing tokens in expression"));
     }
@@ -300,9 +322,9 @@ pub fn eval_expression(src: &str) -> Result<f64, SolverError> {
 /* ------------------------------------------------------------------ */
 
 struct Parsed {
-    answer: f64,
+    program: String,
     steps: Vec<String>,
-    expression: String,
+    check: Option<String>,
 }
 
 fn parse_solver_json(text: &str) -> Result<Parsed, SolverError> {
@@ -310,18 +332,11 @@ fn parse_solver_json(text: &str) -> Result<Parsed, SolverError> {
     let end = text.rfind('}').ok_or_else(|| SolverError::new("INVALID_JSON", "no JSON object in reply"))?;
     let value: Value = serde_json::from_str(&text[start..=end])
         .map_err(|_| SolverError::new("INVALID_JSON", "reply was not valid JSON"))?;
-    let answer = match &value["answer"] {
-        Value::Number(n) => n.as_f64().unwrap_or(f64::NAN),
-        Value::String(s) => s
-            .trim()
-            .parse::<f64>()
-            .map_err(|_| SolverError::new("INVALID_JSON", "answer is not numeric"))?,
-        _ => return Err(SolverError::new("INVALID_JSON", "missing numeric answer")),
-    };
-    let expression = value["verification"]["expression"]
+    let program = value["program"]
         .as_str()
-        .ok_or_else(|| SolverError::new("INVALID_JSON", "missing verification.expression"))?
+        .ok_or_else(|| SolverError::new("INVALID_JSON", "missing program"))?
         .to_string();
+    let check = value["check"].as_str().filter(|s| !s.trim().is_empty()).map(|s| s.to_string());
     let steps = match &value["steps"] {
         Value::Array(arr) => arr
             .iter()
@@ -329,7 +344,64 @@ fn parse_solver_json(text: &str) -> Result<Parsed, SolverError> {
             .collect(),
         _ => Vec::new(),
     };
-    Ok(Parsed { answer, steps, expression })
+    Ok(Parsed { program, steps, check })
+}
+
+/// Execute a model-generated JS-dialect program (let / assignment / result).
+pub fn run_program(src: &str) -> Result<f64, SolverError> {
+    if src.trim().is_empty() {
+        return Err(SolverError::new("PROGRAM_EMPTY", "empty program"));
+    }
+    let mut env = Env::new();
+    let mut result_defined = false;
+    let mut last_value: Option<f64> = None;
+    for line in src.split(['\n', ';']) {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("let ") {
+            if let Some(eq) = rest.find('=') {
+                let name = rest[..eq].trim();
+                let val = eval_expression_with(rest[eq + 1..].trim(), &env)?;
+                env.insert(name.to_string(), val);
+                if name == "result" {
+                    result_defined = true;
+                }
+                continue;
+            }
+        }
+        if let Some(eq) = line.find('=') {
+            let name = line[..eq].trim();
+            let is_ident = !name.is_empty()
+                && name.chars().next().map_or(false, |c| c.is_alphabetic() || c == '_')
+                && name.chars().all(|c| c.is_alphanumeric() || c == '_');
+            if is_ident {
+                let val = eval_expression_with(line[eq + 1..].trim(), &env)?;
+                env.insert(name.to_string(), val);
+                if name == "result" {
+                    result_defined = true;
+                }
+                continue;
+            }
+        }
+        last_value = Some(eval_expression_with(line, &env)?);
+    }
+    if result_defined {
+        return Ok(env["result"]);
+    }
+    if let Some(v) = last_value {
+        return Ok(v);
+    }
+    Err(SolverError::new("PROGRAM_NO_RESULT", "program produced no result"))
+}
+
+/// Substitute {x} with the computed answer; passes when value ~ 0.
+pub fn run_check(check_src: &str, answer: f64) -> Result<(f64, bool), SolverError> {
+    let substituted = check_src.replace("{x}", &format!("({})", answer));
+    let value = eval_expression(&substituted)?;
+    let passed = value.abs() <= 1e-6 * answer.abs().max(1.0);
+    Ok((value, passed))
 }
 
 fn numerically_equal(a: f64, b: f64) -> bool {
@@ -415,8 +487,9 @@ impl MathSolver {
         self
     }
 
-    /// Solve a math problem. `verified` is true only when the model's
-    /// verification expression independently re-evaluates to the answer.
+    /// Solve a math problem. The answer is the output of executing the model's
+    /// program; `verified` is true only when the check expression passes
+    /// (equations: answer substituted back must satisfy the original equation).
     pub fn solve(&self, problem: &str) -> Result<SolveResult, SolverError> {
         if problem.trim().is_empty() {
             return Err(SolverError::new("NO_PROBLEM", "problem must be non-empty"));
@@ -442,42 +515,57 @@ impl MathSolver {
             Err(e) => return Err(e),
         };
 
-        let evaluate = |p: &Parsed| -> (Option<f64>, bool) {
-            match eval_expression(&p.expression) {
-                Ok(ev) => (Some(ev), numerically_equal(ev, p.answer)),
-                Err(_) => (None, false),
+        // attempt: execute program + run check; reports ok/err without throwing.
+        let attempt = |p: &Parsed| -> Result<(f64, Option<f64>, bool), SolverError> {
+            let answer = run_program(&p.program)?;
+            let mut check_value = None;
+            let mut verified = false;
+            if let Some(check) = &p.check {
+                let (v, passed) = run_check(check, answer)?;
+                check_value = Some(v);
+                verified = passed;
             }
+            Ok((answer, check_value, verified))
         };
 
-        let (mut evaluated, mut verified) = evaluate(&parsed);
+        let mut program_error: Option<SolverError> = None;
+        let (mut answer, mut check_value, mut verified) = match attempt(&parsed) {
+            Ok(t) => t,
+            Err(e) => { program_error = Some(e); (f64::NAN, None, false) }
+        };
+        let first_ok = program_error.is_none();
+
         let mut retries = 0u32;
-        if !verified {
+        if !first_ok || !verified {
             retries = 1;
+            let reason = if !first_ok {
+                format!("program failed to execute ({})", program_error.as_ref().map(|e| e.message.clone()).unwrap_or_default())
+            } else {
+                format!("check evaluated to {:?} instead of 0", check_value)
+            };
             messages.push(json!({"role": "assistant", "content": serde_json::to_string(&json!({
-                "answer": parsed.answer, "steps": parsed.steps, "verification": {"expression": parsed.expression}
+                "program": parsed.program, "steps": parsed.steps, "check": parsed.check
             })).unwrap_or_default()}));
             messages.push(json!({"role": "user", "content": format!(
-                "Your verification expression evaluated to {}, which does not match your answer {}. Re-derive the problem carefully and reply again with the same strict JSON shape.",
-                evaluated.map(|v| v.to_string()).unwrap_or_else(|| "an error".into()),
-                parsed.answer
+                "Your submission failed verification: {}. Re-derive the problem carefully and reply again with the same strict JSON shape.", reason
             )}));
-            if let Ok(second) = parse_solver_json(&call(&messages)?) {
-                let (ev2, ok2) = evaluate(&second);
-                if ev2.is_some() {
-                    evaluated = ev2;
-                }
-                if ok2 {
-                    parsed = second;
-                    verified = true;
-                }
+            match parse_solver_json(&call(&messages)?) {
+                Ok(second) => match attempt(&second) {
+                    Ok((a, cv, v)) => {
+                        parsed = second;
+                        answer = a; check_value = cv; verified = v;
+                    }
+                    Err(e) => return Err(e), // PROGRAM_* persisted after retry
+                },
+                Err(e) => return Err(e),
             }
         }
 
         Ok(SolveResult {
-            answer: parsed.answer,
+            answer,
             steps: parsed.steps,
-            expression: parsed.expression,
-            evaluated,
+            expression: parsed.program,
+            evaluated: check_value,
             verified,
             retries,
         })

@@ -143,8 +143,9 @@ fn solve_check_still_failing_unverified() {
 #[ignore = "smoke: set SMOKE_API_KEY to run (cargo test -- --ignored)"]
 fn smoke_real_api() {
     let key = std::env::var("SMOKE_API_KEY").expect("SMOKE_API_KEY");
-    let base = std::env::var("SMOKE_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".into());
-    let solver = MathSolver::new(&key, &base).unwrap();
+    let base = std::env::var("SMOKE_BASE_URL").ok().filter(|b| !b.is_empty()).unwrap_or_else(|| "https://api.openai.com/v1".into());
+    let model = std::env::var("SMOKE_MODEL").ok().filter(|m| !m.is_empty()).unwrap_or_else(|| "gpt-4o-mini".into());
+    let solver = MathSolver::new(&key, &base).unwrap().model(model);
     let r = solver.solve("2x + 3 = 11, solve for x").unwrap();
     println!("smoke: answer={} verified={} retries={}", r.answer, r.verified, r.retries);
     assert!(r.verified);

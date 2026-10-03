@@ -1,10 +1,10 @@
 [package]
-name = "mathsolver"
-version = "0.1.0"
+name = "mathsolver-help"
+version = "0.2.0"
 edition = "2021"
-description = "BYOK AI math solver with independent verification — bring your own OpenAI-compatible API key, answers verified by local expression evaluation."
+description = "BYOK AI math solver with execution-based verification (PAL-style) — bring your own OpenAI-compatible API key; the answer is computed locally by executing a model-generated program, never taken from a number the model stated."
 license = "MIT"
-repository = "https://github.com/mathsolver-help/mathsolver-rust"
+repository = "https://github.com/aiPublicProject/mathsolver-rust"
 homepage = "https://mathsolver.help"
 keywords = ["math", "solver", "ai", "byok", "verification"]
 categories = ["mathematics", "api-bindings"]

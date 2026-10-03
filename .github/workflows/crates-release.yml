@@ -15,4 +15,4 @@ jobs:
             exit 1
           fi
       - run: cargo test
-      - run: cargo publish
+      - run: cargo publish --allow-dirty  # test run bumps Cargo.lock's own version; harmless
